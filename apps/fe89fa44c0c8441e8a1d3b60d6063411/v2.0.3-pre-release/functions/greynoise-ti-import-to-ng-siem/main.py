@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 from typing import Dict
 
 import requests
@@ -22,6 +23,10 @@ CALLBACK_FILE = "ti_greynoise_callback_indicators.csv"
 ETAG_DIR = os.path.join(tempfile.gettempdir(), "greynoise-etags")
 TIMEOUT = (10, 300)
 CHUNK_SIZE = 1 << 20
+# Leaves room inside the function's 900 s limit to download and upload once the
+# feed is built.
+PROVISION_TIMEOUT = 600
+DEFAULT_RETRY_AFTER = 60
 
 
 def import_feeds(body: Dict[str, object], ngsiem, logger) -> list:
@@ -42,10 +47,11 @@ def import_feeds(body: Dict[str, object], ngsiem, logger) -> list:
     if str(body.get("include_callback_feed")).lower() == "true":
         feeds.append(("callback", {"days": "7", "format": "csv", "profile": "ngsiem"}, CALLBACK_FILE))
 
+    deadline = time.monotonic() + PROVISION_TIMEOUT
     results, failures = [], []
     for feed, params, filename in feeds:
         try:
-            results.append(fetch_feed(feed, params, filename, api_key, repository, ngsiem, logger))
+            results.append(fetch_feed(feed, params, filename, api_key, repository, ngsiem, deadline, logger))
         except FDKException as e:
             logger.error(f"{filename}: {e.message}")
             failures.append(e)
@@ -57,7 +63,7 @@ def import_feeds(body: Dict[str, object], ngsiem, logger) -> list:
     return results
 
 
-def fetch_feed(feed, params, filename, api_key, repository, ngsiem, logger) -> dict:
+def fetch_feed(feed, params, filename, api_key, repository, ngsiem, deadline, logger) -> dict:
     cache_key = json.dumps([api_key, repository, feed, params], sort_keys=True).encode()
     etag_path = os.path.join(ETAG_DIR, hashlib.sha256(cache_key).hexdigest())
     headers = {"key": api_key, "X-GreyNoise-Integration": f"crowdstrike-ngsiem/{VERSION}"}
@@ -68,20 +74,11 @@ def fetch_feed(feed, params, filename, api_key, repository, ngsiem, logger) -> d
     work_dir = tempfile.mkdtemp()
     try:
         path = os.path.join(work_dir, filename)
-        with requests.get(f"{API_URL}/{feed}", params=params, headers=headers, stream=True, timeout=TIMEOUT) as resp:
-            result = {"file": filename, "status": "success",
-                      "generated_at": resp.headers.get("X-GreyNoise-Generated-At", "")}
-            rows = resp.headers.get("X-GreyNoise-Row-Count", "")
-            if rows.isdigit():
-                result["row_count"] = int(rows)
-            if "X-GreyNoise-Truncated" in resp.headers:
-                result["truncated"] = resp.headers["X-GreyNoise-Truncated"].lower() == "true"
+        with request_built_feed(feed, params, headers, filename, deadline, logger) as resp:
             if resp.status_code == 304:
-                logger.info(f"{filename}: unchanged")
-                return {**result, "feed_status": "unchanged", "message": "Unchanged since the last import"}
-            if resp.status_code == 202:
-                logger.info(f"{filename}: provisioning")
-                return {**result, "feed_status": "provisioning", "message": "Feed is being built; the next run imports it"}
+                message = f"Unchanged since the last import ({freshness(resp)})"
+                logger.info(f"{filename}: {message}")
+                return {"file": filename, "status": "success", "message": message}
             if resp.status_code != 200:
                 raise FDKException(resp.status_code if resp.status_code >= 400 else 502,
                                    f"{filename}: GreyNoise API returned {resp.status_code}: {api_error(resp)}")
@@ -89,6 +86,7 @@ def fetch_feed(feed, params, filename, api_key, repository, ngsiem, logger) -> d
                 for chunk in resp.iter_content(CHUNK_SIZE):
                     f.write(chunk)
             etag = resp.headers.get("ETag", "")
+            message = f"Imported into {repository} ({freshness(resp)})"
 
         upload = ngsiem.upload_file(lookup_file=path, repository=repository)
         if not 200 <= upload["status_code"] < 300:
@@ -100,12 +98,35 @@ def fetch_feed(feed, params, filename, api_key, repository, ngsiem, logger) -> d
             os.makedirs(ETAG_DIR, exist_ok=True)
             with open(etag_path, "w", encoding="utf-8") as f:
                 f.write(etag)
-        logger.info(f"{filename}: imported {result.get('row_count', 'unknown')} rows into {repository}")
-        return {**result, "feed_status": "updated", "message": "File imported"}
+        logger.info(f"{filename}: {message}")
+        return {"file": filename, "status": "success", "message": message}
     except requests.RequestException as e:
         raise FDKException(502, f"{filename}: GreyNoise API request failed: {e}") from e
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def request_built_feed(feed, params, headers, filename, deadline, logger) -> requests.Response:
+    while True:
+        resp = requests.get(f"{API_URL}/{feed}", params=params, headers=headers, stream=True, timeout=TIMEOUT)
+        if resp.status_code != 202:
+            return resp
+        resp.close()
+        retry_after = resp.headers.get("Retry-After", "")
+        wait = max(int(retry_after), 1) if retry_after.isdigit() else DEFAULT_RETRY_AFTER
+        if time.monotonic() + wait > deadline:
+            raise FDKException(504, f"{filename}: GreyNoise is still building the feed after {PROVISION_TIMEOUT} s")
+        logger.info(f"{filename}: GreyNoise is building the feed; retrying in {wait} s")
+        time.sleep(wait)
+
+
+def freshness(resp) -> str:
+    parts = [f"generated at {resp.headers.get('X-GreyNoise-Generated-At') or 'unknown'}"]
+    if resp.headers.get("X-GreyNoise-Row-Count", "").isdigit():
+        parts.append(f"{resp.headers['X-GreyNoise-Row-Count']} rows")
+    if resp.headers.get("X-GreyNoise-Truncated", "").lower() == "true":
+        parts.append("truncated")
+    return ", ".join(parts)
 
 
 def api_error(resp) -> str:

@@ -42,23 +42,92 @@ def ok_headers(etag='"v1"', rows="1", truncated="false"):
             "X-GreyNoise-Row-Count": rows, "X-GreyNoise-Truncated": truncated}
 
 
-@pytest.mark.parametrize("name, status, kwargs, feed_status, uploaded", [
-    ("200 overwrites the lookup", 200, {"body": CSV, "headers": ok_headers()}, "updated", True),
-    ("304 records unchanged", 304, {"headers": {"ETag": '"v1"'}}, "unchanged", False),
-    ("202 records provisioning", 202, {"json": {"status": "provisioning"}, "headers": {"Retry-After": "60"}},
-     "provisioning", False),
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+@pytest.fixture(autouse=True)
+def clock(monkeypatch):
+    fake = FakeClock()
+    monkeypatch.setattr(main, "time", fake)
+    return fake
+
+
+@pytest.mark.parametrize("name, status, kwargs, message, uploaded", [
+    ("200 overwrites the lookup", 200, {"body": CSV, "headers": ok_headers()},
+     "Imported into search-all (generated at 2026-10-29T15:00:00Z, 1 rows)", True),
+    ("304 records unchanged", 304,
+     {"headers": {"ETag": '"v1"', "X-GreyNoise-Generated-At": "2026-10-29T15:00:00Z"}},
+     "Unchanged since the last import (generated at 2026-10-29T15:00:00Z)", False),
 ])
 @responses.activate
-def test_gnql_success_paths(name, status, kwargs, feed_status, uploaded):
+def test_gnql_success_paths(name, status, kwargs, message, uploaded):
     responses.get(GNQL_URL, status=status, **kwargs)
     ngsiem = FakeNGSIEM()
 
     results = main.import_feeds({"api_key": "k"}, ngsiem, LOG)
 
-    assert [r["feed_status"] for r in results] == [feed_status]
-    assert results[0]["status"] == "success"
-    assert results[0]["file"] == "ti_greynoise_indicators.csv"
+    assert results == [{"file": "ti_greynoise_indicators.csv", "status": "success", "message": message}]
     assert bool(ngsiem.uploads) == uploaded
+
+
+@pytest.mark.parametrize("name, retry_after, want_sleeps", [
+    ("honours Retry-After", "30", [30, 30]),
+    ("defaults without Retry-After", None, [60, 60]),
+    ("defaults on an unparseable Retry-After", "soon", [60, 60]),
+])
+@responses.activate
+def test_202_waits_for_provisioning_then_imports(name, retry_after, want_sleeps, clock):
+    building = {"Retry-After": retry_after} if retry_after else {}
+    responses.get(GNQL_URL, status=202, json={"status": "provisioning"}, headers=building)
+    responses.get(GNQL_URL, status=202, json={"status": "provisioning"}, headers=building)
+    responses.get(GNQL_URL, body=CSV, headers=ok_headers())
+    ngsiem = FakeNGSIEM()
+
+    [result] = main.import_feeds({"api_key": "k"}, ngsiem, LOG)
+
+    assert clock.sleeps == want_sleeps
+    assert len(responses.calls) == 3
+    assert result["message"].startswith("Imported")
+    assert ngsiem.uploads == [("ti_greynoise_indicators.csv", "search-all", CSV)]
+
+
+@responses.activate
+def test_202_past_the_deadline_raises(clock):
+    responses.get(GNQL_URL, status=202, json={"status": "provisioning"}, headers={"Retry-After": "60"})
+    ngsiem = FakeNGSIEM()
+
+    with pytest.raises(FDKException) as exc:
+        main.import_feeds({"api_key": "k"}, ngsiem, LOG)
+
+    assert exc.value.code == 504
+    assert "still building" in exc.value.message
+    assert sum(clock.sleeps) <= main.PROVISION_TIMEOUT
+    assert ngsiem.uploads == []
+
+
+@responses.activate
+def test_provisioning_deadline_is_shared_across_feeds(clock):
+    responses.get(GNQL_URL, status=202, headers={"Retry-After": "300"})
+    responses.get(GNQL_URL, status=202, headers={"Retry-After": "300"})
+    responses.get(GNQL_URL, body=CSV, headers=ok_headers())
+    responses.get(CALLBACK_URL, status=202, headers={"Retry-After": "60"})
+
+    with pytest.raises(FDKException) as exc:
+        main.import_feeds({"api_key": "k", "include_callback_feed": True}, FakeNGSIEM(), LOG)
+
+    assert exc.value.code == 504
+    assert "ti_greynoise_callback_indicators.csv" in exc.value.message
+    assert clock.sleeps == [300, 300]
 
 
 @pytest.mark.parametrize("name, status, body, code, message", [
@@ -91,9 +160,7 @@ def test_200_uploads_body_and_reports_freshness(etag_dir):
     [result] = main.import_feeds({"api_key": "k", "repository": "my-repo"}, ngsiem, LOG)
 
     assert ngsiem.uploads == [("ti_greynoise_indicators.csv", "my-repo", CSV)]
-    assert result["generated_at"] == "2026-10-29T15:00:00Z"
-    assert result["row_count"] == 1
-    assert result["truncated"] is True
+    assert result["message"] == "Imported into my-repo (generated at 2026-10-29T15:00:00Z, 1 rows, truncated)"
     assert [p.read_text() for p in etag_dir.iterdir()] == ['"v1"']
 
 
@@ -154,7 +221,7 @@ def test_saved_etag_is_sent_and_304_skips_upload():
 
     assert "If-None-Match" not in responses.calls[0].request.headers
     assert responses.calls[1].request.headers["If-None-Match"] == '"v1"'
-    assert result["feed_status"] == "unchanged"
+    assert result["message"].startswith("Unchanged")
     assert len(ngsiem.uploads) == 1
 
 
@@ -253,16 +320,6 @@ def test_unexpected_error_raises_with_message_and_other_feed_still_runs():
     assert calls == ["ti_greynoise_indicators.csv", "ti_greynoise_callback_indicators.csv"]
 
 
-@responses.activate
-def test_304_without_row_headers_omits_counts():
-    responses.get(GNQL_URL, status=304, headers={"ETag": '"v1"'})
-
-    [result] = main.import_feeds({"api_key": "k"}, FakeNGSIEM(), LOG)
-
-    assert "row_count" not in result
-    assert "truncated" not in result
-
-
 def test_missing_api_key_raises():
     with pytest.raises(FDKException) as exc:
         main.import_feeds({}, FakeNGSIEM(), LOG)
@@ -276,4 +333,4 @@ def test_handler_returns_results():
     with mock.patch.object(main, "NGSIEM", FakeNGSIEM):
         resp = router.route(main.Request(method="POST", url="/greynoise-ti-import-bulk", body={"api_key": "k"}), logger=LOG)
     assert resp.code == 200
-    assert resp.body["results"][0]["feed_status"] == "unchanged"
+    assert resp.body["results"][0]["message"].startswith("Unchanged")
