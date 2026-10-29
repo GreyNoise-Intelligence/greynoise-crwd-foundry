@@ -19,6 +19,23 @@
                   "message": {
                       "type": "string",
                       "description": "Details about the processing result"
+                  },
+                  "feed_status": {
+                      "type": "string",
+                      "enum": ["updated", "unchanged", "provisioning"],
+                      "description": "Whether the lookup file was replaced, was already current, or is waiting for GreyNoise to build the feed"
+                  },
+                  "generated_at": {
+                      "type": "string",
+                      "description": "When GreyNoise generated the feed, in RFC 3339"
+                  },
+                  "row_count": {
+                      "type": "integer",
+                      "description": "Number of indicators in the feed file"
+                  },
+                  "truncated": {
+                      "type": "boolean",
+                      "description": "True when the feed was cut to max_indicator_count or the lookup file size limit"
                   }
               },
               "required": ["file", "status", "message"]

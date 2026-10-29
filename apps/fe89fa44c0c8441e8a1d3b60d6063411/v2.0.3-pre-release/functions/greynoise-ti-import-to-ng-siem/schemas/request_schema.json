@@ -18,8 +18,7 @@
     },
     "max_indicator_count": {
       "type": "string",
-      "description": "Maximum number of indicators to import",
-      "default": "100000"
+      "description": "Maximum number of indicators to import"
     },
     "include_callback_feed": {
       "type": "boolean",

@@ -8,7 +8,6 @@ parameters:
                         required: true
                     max_indicator_count:
                         required: false
-                        default_value: "100000"
                     query:
                         required: false
                         default_value: "last_seen:1d -classification:unknown"
@@ -24,11 +23,11 @@ trigger:
         - greynoise_ti_import_bulk_a6513819
     event: Schedule
     schedule:
-        time_cycle: 0 3 */1 * *
+        time_cycle: 0 * * * *
         start_date: ""
         end_date: ""
         tz: America/New_York
-        skip_concurrent: false
+        skip_concurrent: true
 actions:
     greynoise_ti_import_bulk_a6513819:
         id: functions.greynoise-ti-import-to-ng-siem.greynoise-ti-import-bulk
