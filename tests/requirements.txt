@@ -1,3 +1,6 @@
 pytest
 responses
--r ../apps/fe89fa44c0c8441e8a1d3b60d6063411/v2.0.3-pre-release/functions/greynoise-ti-import-to-ng-siem/requirements.txt
+crowdstrike-foundry-function==1.1.4
+crowdstrike-falconpy
+# Until greynoise 3.2.0 is released with the /v3/files methods (wegman12/pygreynoise#1).
+greynoise @ git+https://github.com/wegman12/pygreynoise@kwegman/v3-files-feeds
