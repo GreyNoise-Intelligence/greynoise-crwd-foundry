@@ -1,5 +1,3 @@
-import hashlib
-import json
 import os
 import shutil
 import tempfile
@@ -19,10 +17,6 @@ INTEGRATION = f"crowdstrike-ngsiem/{VERSION}"
 DEFAULT_QUERY = "last_seen:1d -classification:unknown"
 GNQL_FILE = "ti_greynoise_indicators.csv"
 CALLBACK_FILE = "ti_greynoise_callback_indicators.csv"
-# /tmp outlives a warm invocation but not a cold start; losing an ETag costs one
-# full download, never a missed update. No collection, so the auth scopes stay
-# as published and this ships as a minor version.
-ETAG_DIR = os.path.join(tempfile.gettempdir(), "greynoise-etags")
 TIMEOUT = (10, 300)
 # Leaves room inside the function's 900 s limit to download and upload once the
 # feed is built.
@@ -40,18 +34,15 @@ def import_feeds(body: Dict[str, object], ngsiem, logger) -> list:
     limit = int(limit) if limit.isdigit() and int(limit) > 0 else None
 
     gn = GreyNoise(APIConfig(api_key=api_key, integration_name=INTEGRATION, timeout=TIMEOUT))
-    feeds = [(GNQL_FILE, [query, limit],
-              partial(gn.gnql_file_metadata, query, limit=limit), partial(gn.gnql_file, query, limit=limit))]
+    feeds = [(GNQL_FILE, partial(gn.gnql_file_metadata, query, limit=limit), partial(gn.gnql_file, query, limit=limit))]
     if str(body.get("include_callback_feed")).lower() == "true":
-        feeds.append((CALLBACK_FILE, [], gn.callback_file_metadata, gn.callback_file))
+        feeds.append((CALLBACK_FILE, gn.callback_file_metadata, gn.callback_file))
 
     deadline = time.monotonic() + PROVISION_TIMEOUT
     results, failures = [], []
-    for filename, params, metadata, download in feeds:
-        cache_key = json.dumps([api_key, repository, filename, params]).encode()
-        etag_path = os.path.join(ETAG_DIR, hashlib.sha256(cache_key).hexdigest())
+    for filename, metadata, download in feeds:
         try:
-            results.append(fetch_feed(filename, metadata, download, etag_path, repository, ngsiem, deadline, logger))
+            results.append(fetch_feed(filename, metadata, download, repository, ngsiem, deadline, logger))
         except FDKException as e:
             logger.error(f"{filename}: {e.message}")
             failures.append(e)
@@ -63,21 +54,12 @@ def import_feeds(body: Dict[str, object], ngsiem, logger) -> list:
     return results
 
 
-def fetch_feed(filename, metadata, download, etag_path, repository, ngsiem, deadline, logger) -> dict:
+def fetch_feed(filename, metadata, download, repository, ngsiem, deadline, logger) -> dict:
     work_dir = tempfile.mkdtemp()
     try:
-        built = wait_until_built(filename, metadata, deadline, logger)
-        etag = None
-        if os.path.exists(etag_path):
-            with open(etag_path, encoding="utf-8") as f:
-                etag = f.read()
-
+        wait_until_built(filename, metadata, deadline, logger)
         path = os.path.join(work_dir, filename)
-        result = download(path, etag=etag, integration=INTEGRATION)
-        if result.status == FileResult.STATUS_NOT_MODIFIED:
-            message = f"Unchanged since the last import ({freshness(built)})"
-            logger.info(f"{filename}: {message}")
-            return {"file": filename, "status": "success", "message": message}
+        result = download(path, integration=INTEGRATION)
         if result.status != FileResult.STATUS_OK:
             raise FDKException(502, f"{filename}: GreyNoise returned {result.status} after reporting the feed built")
 
@@ -87,10 +69,6 @@ def fetch_feed(filename, metadata, download, etag_path, repository, ngsiem, dead
             raise FDKException(502, f"{filename}: NGSIEM upload returned {upload['status_code']}: "
                                     f"{errors[0].get('message', 'unknown error')}")
 
-        if result.etag:
-            os.makedirs(ETAG_DIR, exist_ok=True)
-            with open(etag_path, "w", encoding="utf-8") as f:
-                f.write(result.etag)
         message = f"Imported into {repository} ({freshness(result)})"
         logger.info(f"{filename}: {message}")
         return {"file": filename, "status": "success", "message": message}
@@ -103,11 +81,11 @@ def fetch_feed(filename, metadata, download, etag_path, repository, ngsiem, dead
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
-def wait_until_built(filename, metadata, deadline, logger) -> FileResult:
+def wait_until_built(filename, metadata, deadline, logger) -> None:
     while True:
         built = metadata(integration=INTEGRATION)
         if built.status == FileResult.STATUS_OK:
-            return built
+            return
         wait = max(built.retry_after or DEFAULT_RETRY_AFTER, 1)
         if time.monotonic() + wait > deadline:
             raise FDKException(504, f"{filename}: GreyNoise is still building the feed after {PROVISION_TIMEOUT} s")

@@ -48,20 +48,14 @@ class FakeClock:
 
 
 @pytest.fixture(autouse=True)
-def etag_dir(tmp_path, monkeypatch):
-    monkeypatch.setattr(main, "ETAG_DIR", str(tmp_path / "etags"))
-    return tmp_path / "etags"
-
-
-@pytest.fixture(autouse=True)
 def clock(monkeypatch):
     fake = FakeClock()
     monkeypatch.setattr(main, "time", fake)
     return fake
 
 
-def feed_headers(etag='"v1"', rows="1", truncated="false"):
-    return {"ETag": etag, "X-GreyNoise-Generated-At": GENERATED_AT,
+def feed_headers(rows="1", truncated="false"):
+    return {"X-GreyNoise-Generated-At": GENERATED_AT,
             "X-GreyNoise-Row-Count": rows, "X-GreyNoise-Truncated": truncated}
 
 
@@ -74,26 +68,25 @@ def building(url=GNQL_METADATA_URL, retry_after="60"):
                   headers={"Retry-After": retry_after} if retry_after else {})
 
 
+def served(url=GNQL_URL):
+    responses.get(url, body=CSV, headers=feed_headers())
+
+
 def calls_to(url):
     return [c for c in responses.calls if c.request.url.split("?")[0] == url]
 
 
-@pytest.mark.parametrize("name, status, kwargs, message, uploaded", [
-    ("200 overwrites the lookup", 200, {"body": CSV, "headers": feed_headers()},
-     f"Imported into search-all (generated at {GENERATED_AT}, 1 rows)", True),
-    ("304 records unchanged with the metadata's freshness", 304, {"headers": {"ETag": '"v1"'}},
-     f"Unchanged since the last import (generated at {GENERATED_AT}, 1 rows)", False),
-])
 @responses.activate
-def test_gnql_success_paths(name, status, kwargs, message, uploaded):
+def test_200_overwrites_the_lookup():
     built()
-    responses.get(GNQL_URL, status=status, **kwargs)
+    served()
     ngsiem = FakeNGSIEM()
 
     results = main.import_feeds({"api_key": "k"}, ngsiem, LOG)
 
-    assert results == [{"file": "ti_greynoise_indicators.csv", "status": "success", "message": message}]
-    assert bool(ngsiem.uploads) == uploaded
+    assert results == [{"file": "ti_greynoise_indicators.csv", "status": "success",
+                        "message": f"Imported into search-all (generated at {GENERATED_AT}, 1 rows)"}]
+    assert ngsiem.uploads == [("ti_greynoise_indicators.csv", "search-all", CSV)]
 
 
 @pytest.mark.parametrize("name, retry_after, want_sleeps", [
@@ -149,16 +142,22 @@ def test_provisioning_deadline_is_shared_across_feeds(clock):
     assert clock.sleeps == [300, 300]
 
 
+@pytest.mark.parametrize("name, status, status_name", [
+    ("provisioning after metadata reported built", 202, "provisioning"),
+    ("unexpected 304", 304, "not_modified"),
+])
 @responses.activate
-def test_download_provisioning_after_metadata_reported_built_raises():
+def test_download_not_ok_after_metadata_reported_built_raises(name, status, status_name):
     built()
-    building(GNQL_URL)
+    responses.get(GNQL_URL, status=status)
+    ngsiem = FakeNGSIEM()
 
     with pytest.raises(FDKException) as exc:
-        main.import_feeds({"api_key": "k"}, FakeNGSIEM(), LOG)
+        main.import_feeds({"api_key": "k"}, ngsiem, LOG)
 
     assert exc.value.code == 502
-    assert "provisioning" in exc.value.message
+    assert status_name in exc.value.message
+    assert ngsiem.uploads == []
 
 
 @pytest.mark.parametrize("name, url, status, body, code, message", [
@@ -190,7 +189,7 @@ def test_error_responses_raise(name, url, status, body, code, message):
 
 
 @responses.activate
-def test_200_uploads_body_and_reports_freshness(etag_dir):
+def test_200_reports_freshness():
     built(rows="1", truncated="true")
     responses.get(GNQL_URL, body=CSV, headers=feed_headers(rows="1", truncated="true"))
     ngsiem = FakeNGSIEM()
@@ -199,7 +198,6 @@ def test_200_uploads_body_and_reports_freshness(etag_dir):
 
     assert ngsiem.uploads == [("ti_greynoise_indicators.csv", "my-repo", CSV)]
     assert result["message"] == f"Imported into my-repo (generated at {GENERATED_AT}, 1 rows, truncated)"
-    assert [p.read_text() for p in etag_dir.iterdir()] == ['"v1"']
 
 
 @responses.activate
@@ -208,7 +206,7 @@ def test_200_deletes_the_temp_file(tmp_path, monkeypatch):
     work.mkdir()
     monkeypatch.setattr(main.tempfile, "mkdtemp", lambda: str(work))
     built()
-    responses.get(GNQL_URL, body=CSV, headers=feed_headers())
+    served()
 
     main.import_feeds({"api_key": "k"}, FakeNGSIEM(), LOG)
 
@@ -218,18 +216,18 @@ def test_200_deletes_the_temp_file(tmp_path, monkeypatch):
 @responses.activate
 def test_gzip_body_is_decoded_before_upload():
     built()
-    responses.get(GNQL_URL, status=304)
+    served()
     built(CALLBACK_METADATA_URL)
     responses.get(CALLBACK_URL, body=gzip.compress(CSV), headers={**feed_headers(), "Content-Encoding": "gzip"})
     ngsiem = FakeNGSIEM()
 
     main.import_feeds({"api_key": "k", "include_callback_feed": True}, ngsiem, LOG)
 
-    assert ngsiem.uploads == [("ti_greynoise_callback_indicators.csv", "search-all", CSV)]
+    assert ngsiem.uploads[1] == ("ti_greynoise_callback_indicators.csv", "search-all", CSV)
 
 
 @responses.activate
-def test_failed_upload_raises_and_keeps_the_old_etag(etag_dir):
+def test_failed_upload_raises():
     built()
     responses.get(GNQL_URL, body=CSV, headers=feed_headers())
 
@@ -238,7 +236,6 @@ def test_failed_upload_raises_and_keeps_the_old_etag(etag_dir):
 
     assert exc.value.code == 502
     assert "upload rejected" in exc.value.message
-    assert not etag_dir.exists()
 
 
 @responses.activate
@@ -254,37 +251,17 @@ def test_interrupted_download_raises():
 
 
 @responses.activate
-def test_saved_etag_is_sent_and_304_skips_upload():
+def test_every_run_downloads_and_uploads_without_if_none_match():
     built()
-    responses.get(GNQL_URL, body=CSV, headers=feed_headers(etag='"v1"'))
-    responses.get(GNQL_URL, status=304, headers={"ETag": '"v1"'})
+    served()
     ngsiem = FakeNGSIEM()
 
     main.import_feeds({"api_key": "k"}, ngsiem, LOG)
-    [result] = main.import_feeds({"api_key": "k"}, ngsiem, LOG)
+    main.import_feeds({"api_key": "k"}, ngsiem, LOG)
 
-    first, second = calls_to(GNQL_URL)
-    assert "If-None-Match" not in first.request.headers
-    assert second.request.headers["If-None-Match"] == '"v1"'
-    assert result["message"].startswith("Unchanged")
-    assert len(ngsiem.uploads) == 1
-
-
-@pytest.mark.parametrize("name, first, second", [
-    ("changed query", {"query": "a"}, {"query": "b"}),
-    ("changed limit", {"max_indicator_count": "10"}, {"max_indicator_count": "20"}),
-    ("changed repository", {"repository": "a"}, {"repository": "b"}),
-    ("changed api key", {"api_key": "k1"}, {"api_key": "k2"}),
-])
-@responses.activate
-def test_changed_settings_do_not_reuse_the_etag(name, first, second):
-    built()
-    responses.get(GNQL_URL, body=CSV, headers=feed_headers(etag='"v1"'))
-
-    main.import_feeds({"api_key": "k", **first}, FakeNGSIEM(), LOG)
-    main.import_feeds({"api_key": "k", **second}, FakeNGSIEM(), LOG)
-
-    assert "If-None-Match" not in calls_to(GNQL_URL)[1].request.headers
+    assert len(calls_to(GNQL_URL)) == 2
+    assert all("If-None-Match" not in c.request.headers for c in responses.calls)
+    assert len(ngsiem.uploads) == 2
 
 
 @pytest.mark.parametrize("name, body, want_params", [
@@ -298,7 +275,7 @@ def test_changed_settings_do_not_reuse_the_etag(name, first, second):
 @responses.activate
 def test_gnql_requests(name, body, want_params):
     built()
-    responses.get(GNQL_URL, status=304)
+    served()
 
     main.import_feeds(body, FakeNGSIEM(), LOG)
 
@@ -318,9 +295,9 @@ def test_gnql_requests(name, body, want_params):
 @responses.activate
 def test_callback_feed_toggle(name, include, want_urls):
     built()
-    responses.get(GNQL_URL, status=304)
+    served()
     built(CALLBACK_METADATA_URL)
-    responses.get(CALLBACK_URL, status=304)
+    served(CALLBACK_URL)
 
     main.import_feeds({"api_key": "k", "include_callback_feed": include}, FakeNGSIEM(), LOG)
 
@@ -378,10 +355,10 @@ def test_missing_api_key_raises():
 @responses.activate
 def test_handler_returns_results():
     built()
-    responses.get(GNQL_URL, status=304)
+    served()
     router = main.func._router
     with mock.patch.object(main, "NGSIEM", FakeNGSIEM):
         resp = router.route(main.Request(method="POST", url="/greynoise-ti-import-bulk", body={"api_key": "k"}),
                             logger=LOG)
     assert resp.code == 200
-    assert resp.body["results"][0]["message"].startswith("Unchanged")
+    assert resp.body["results"][0]["message"].startswith("Imported")
