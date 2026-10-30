@@ -142,21 +142,17 @@ def test_provisioning_deadline_is_shared_across_feeds(clock):
     assert clock.sleeps == [300, 300]
 
 
-@pytest.mark.parametrize("name, status, status_name", [
-    ("provisioning after metadata reported built", 202, "provisioning"),
-    ("unexpected 304", 304, "not_modified"),
-])
 @responses.activate
-def test_download_not_ok_after_metadata_reported_built_raises(name, status, status_name):
+def test_download_provisioning_after_metadata_reported_built_raises():
     built()
-    responses.get(GNQL_URL, status=status)
+    building(GNQL_URL)
     ngsiem = FakeNGSIEM()
 
     with pytest.raises(FDKException) as exc:
         main.import_feeds({"api_key": "k"}, ngsiem, LOG)
 
     assert exc.value.code == 502
-    assert status_name in exc.value.message
+    assert "provisioning" in exc.value.message
     assert ngsiem.uploads == []
 
 

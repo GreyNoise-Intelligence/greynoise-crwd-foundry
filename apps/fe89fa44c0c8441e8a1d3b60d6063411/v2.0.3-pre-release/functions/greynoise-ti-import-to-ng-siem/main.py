@@ -44,7 +44,7 @@ def import_feeds(body: Dict[str, object], ngsiem, logger) -> list:
         try:
             results.append(fetch_feed(filename, metadata, download, repository, ngsiem, deadline, logger))
         except FDKException as e:
-            logger.error(f"{filename}: {e.message}")
+            logger.error(e.message)
             failures.append(e)
         except Exception as e:
             logger.error(f"{filename}: {e}", exc_info=True)
