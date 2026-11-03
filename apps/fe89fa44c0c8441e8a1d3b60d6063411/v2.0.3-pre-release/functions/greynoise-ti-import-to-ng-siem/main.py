@@ -14,6 +14,7 @@ func = Function.instance()
 
 VERSION = "3.1.0"
 INTEGRATION = f"crowdstrike-ngsiem/{VERSION}"
+INTEGRATION_NAME = f"CrowdStrike Foundry v{VERSION}"
 DEFAULT_QUERY = "last_seen:1d -classification:unknown"
 GNQL_FILE = "ti_greynoise_indicators.csv"
 CALLBACK_FILE = "ti_greynoise_callback_indicators.csv"
@@ -33,7 +34,7 @@ def import_feeds(body: Dict[str, object], ngsiem, logger) -> list:
     limit = str(body.get("max_indicator_count") or "").strip()
     limit = int(limit) if limit.isdigit() and int(limit) > 0 else None
 
-    gn = GreyNoise(APIConfig(api_key=api_key, integration_name=INTEGRATION, timeout=TIMEOUT))
+    gn = GreyNoise(APIConfig(api_key=api_key, integration_name=INTEGRATION_NAME, timeout=TIMEOUT))
     feeds = [(GNQL_FILE, partial(gn.gnql_file_metadata, query, limit=limit), partial(gn.gnql_file, query, limit=limit))]
     if str(body.get("include_callback_feed")).lower() == "true":
         feeds.append((CALLBACK_FILE, gn.callback_file_metadata, gn.callback_file))

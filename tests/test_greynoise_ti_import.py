@@ -280,6 +280,7 @@ def test_gnql_requests(name, body, want_params):
         assert call.request.params == want_params
         assert call.request.headers["key"] == "k"
         assert call.request.headers["X-GreyNoise-Integration"] == f"crowdstrike-ngsiem/{main.VERSION}"
+        assert call.request.headers["User-Agent"].endswith(f"(CrowdStrike Foundry v{main.VERSION})")
 
 
 @pytest.mark.parametrize("name, include, want_urls", [
